@@ -1,0 +1,50 @@
+name: Codex Reset WeCom Monitor
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Choose an action
+        required: true
+        default: send-test-notification
+        type: choice
+        options:
+          - send-test-notification
+          - check-now
+
+permissions:
+  contents: write
+
+concurrency:
+  group: codex-reset-wecom-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Send test notification
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'send-test-notification'
+        env:
+          WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+        run: python monitor.py --send-test
+
+      - name: Check forecast
+        if: github.event_name == 'schedule' || inputs.mode == 'check-now'
+        env:
+          ALERT_THRESHOLD: "80"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          STATE_BRANCH: monitor-state
+          WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+        run: python monitor.py
