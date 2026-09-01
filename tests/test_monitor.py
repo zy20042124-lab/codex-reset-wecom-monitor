@@ -5,7 +5,15 @@ from datetime import datetime, timezone
 from unittest.mock import patch
 from urllib.error import URLError
 
-from monitor import Forecast, Monitor, MonitorState, NotificationError, WeComNotifier
+from monitor import (
+    Forecast,
+    Monitor,
+    MonitorState,
+    NotificationError,
+    WeComNotifier,
+    fetch_forecast,
+    format_beijing,
+)
 
 
 NOW = datetime(2026, 8, 31, 8, 0, tzinfo=timezone.utc)
@@ -122,6 +130,48 @@ class WeComNotifierTests(unittest.TestCase):
             with self.assertRaises(NotificationError) as caught:
                 notifier.send_test_notification(NOW)
         self.assertNotIn("test-webhook-key", str(caught.exception))
+
+    def test_test_notification_uses_plain_text_payload(self) -> None:
+        notifier = WeComNotifier(self.WEBHOOK)
+        with patch("monitor.request_json", return_value={"errcode": 0}) as request:
+            notifier.send_test_notification(NOW)
+
+        payload = request.call_args.kwargs["payload"]
+        self.assertEqual(payload["msgtype"], "text")
+        self.assertIn("微信兼容纯文本", payload["text"]["content"])
+        self.assertNotIn("markdown", payload)
+
+    def test_beijing_format_respects_existing_timezone(self) -> None:
+        self.assertEqual(format_beijing("2026-08-23T21:00:00Z"), "2026-08-24 05:00:00")
+        self.assertEqual(format_beijing("2026-08-24T05:00:00+08:00"), "2026-08-24 05:00:00")
+
+    def test_forecast_reads_normalized_reset_window(self) -> None:
+        payload = {
+            "updated_at": "2026-08-23T06:30:00Z",
+            "last_reset_at": "2026-08-20T00:00:00Z",
+            "probabilities": {"rounded_24h": 90},
+            "latest_alert": {
+                "source_at": "2026-08-23T06:29:05Z",
+                "summary": "Reset around 2 PM PT",
+                "url": "https://x.com/example/status/1",
+                "window": {
+                    "label": "around 2 PM PT on Aug 23",
+                    "start_at": "2026-08-23T20:00:00Z",
+                    "end_at": "2026-08-23T22:00:00Z",
+                    "target_at": "2026-08-23T21:00:00Z",
+                    "time_zone": "America/Los_Angeles",
+                },
+            },
+        }
+        with patch("monitor.request_json", return_value=payload):
+            forecast = fetch_forecast(attempts=1)
+
+        self.assertEqual(forecast.announcement_at, "2026-08-23T06:29:05Z")
+        self.assertEqual(forecast.window_target_at, "2026-08-23T21:00:00Z")
+        self.assertEqual(
+            WeComNotifier._window_lines(forecast)[0],
+            "预计重置窗口：2026-08-24 04:00:00 至 2026-08-24 06:00:00（北京时间）",
+        )
 
 
 if __name__ == "__main__":

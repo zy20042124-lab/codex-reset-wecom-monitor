@@ -45,6 +45,14 @@ class Forecast:
     last_reset_at: str
     confidence: str | None = None
     confidence_note: str | None = None
+    announcement_at: str | None = None
+    announcement_summary: str | None = None
+    announcement_url: str | None = None
+    window_start_at: str | None = None
+    window_end_at: str | None = None
+    window_target_at: str | None = None
+    window_label: str | None = None
+    window_timezone: str | None = None
 
 
 @dataclass
@@ -93,6 +101,16 @@ def parse_iso(value: str) -> datetime:
 def format_beijing(value: str | datetime) -> str:
     parsed = parse_iso(value) if isinstance(value, str) else value
     return parsed.astimezone(BEIJING).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def valid_timestamp(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parse_iso(value)
+    except ValueError:
+        return None
+    return value
 
 
 def heartbeat_due(state: MonitorState, now: datetime) -> bool:
@@ -183,12 +201,34 @@ def fetch_forecast(*, attempts: int = 3, timeout: int = 15) -> Forecast:
 
             confidence = payload.get("confidence")
             confidence_note = payload.get("confidence_note")
+            latest_alert = payload.get("latest_alert")
+            if not isinstance(latest_alert, dict):
+                latest_alert = {}
+            window = latest_alert.get("window")
+            if not isinstance(window, dict):
+                window = payload.get("teased_window")
+            if not isinstance(window, dict):
+                window = {}
             return Forecast(
                 probability_24h=probability_int,
                 updated_at=updated_at,
                 last_reset_at=last_reset_at,
                 confidence=confidence if isinstance(confidence, str) else None,
                 confidence_note=confidence_note if isinstance(confidence_note, str) else None,
+                announcement_at=valid_timestamp(latest_alert.get("source_at")),
+                announcement_summary=(
+                    latest_alert.get("summary") if isinstance(latest_alert.get("summary"), str) else None
+                ),
+                announcement_url=(
+                    latest_alert.get("url") if isinstance(latest_alert.get("url"), str) else None
+                ),
+                window_start_at=valid_timestamp(window.get("start_at")),
+                window_end_at=valid_timestamp(window.get("end_at")),
+                window_target_at=valid_timestamp(window.get("target_at")),
+                window_label=window.get("label") if isinstance(window.get("label"), str) else None,
+                window_timezone=(
+                    window.get("time_zone") if isinstance(window.get("time_zone"), str) else None
+                ),
             )
         except (MonitorError, ValueError, TypeError) as exc:
             last_error = exc
@@ -214,14 +254,14 @@ class WeComNotifier:
     def from_env(cls) -> "WeComNotifier":
         return cls(os.getenv("WECOM_WEBHOOK", ""))
 
-    def _send_markdown(self, content: str) -> None:
-        if len(content.encode("utf-8")) > 4096:
-            raise NotificationError("Enterprise WeChat Markdown message exceeds 4096 bytes")
+    def _send_text(self, content: str) -> None:
+        if len(content.encode("utf-8")) > 2048:
+            raise NotificationError("Enterprise WeChat text message exceeds 2048 bytes")
         try:
             response = request_json(
                 self.webhook,
                 method="POST",
-                payload={"msgtype": "markdown", "markdown": {"content": content}},
+                payload={"msgtype": "text", "text": {"content": content}},
                 timeout=20,
                 label="Enterprise WeChat webhook",
             )
@@ -238,76 +278,97 @@ class WeComNotifier:
     def _confidence_label(value: str | None) -> str:
         return {"low": "低", "medium": "中", "high": "高"}.get(value or "", value or "未提供")
 
+    @staticmethod
+    def _announcement_at(forecast: Forecast) -> str:
+        return forecast.announcement_at or forecast.last_reset_at
+
+    @staticmethod
+    def _window_lines(forecast: Forecast) -> list[str]:
+        if forecast.window_start_at and forecast.window_end_at:
+            start = format_beijing(forecast.window_start_at)
+            end = format_beijing(forecast.window_end_at)
+            lines = [f"预计重置窗口：{start} 至 {end}（北京时间）"]
+        elif forecast.window_target_at:
+            lines = [f"预计重置时间：{format_beijing(forecast.window_target_at)}（北京时间）"]
+        else:
+            return []
+
+        if forecast.window_label:
+            lines.append(f"原公告时间表述：{forecast.window_label}")
+        return lines
+
     def send_probability_alert(self, forecast: Forecast, threshold: int, checked_at: datetime) -> None:
         content = "\n".join(
             [
-                "### Codex 重置预报",
-                "> 状态：<font color=\"warning\">较高（第三方预测）</font>",
-                f"> 未来 24 小时概率：<font color=\"warning\">{forecast.probability_24h}%</font>",
-                f"> 提醒阈值：严格大于 {threshold}%",
-                f"> 模型置信度：{self._confidence_label(forecast.confidence)}",
-                f"> 检查时间：{format_beijing(checked_at)}（北京时间）",
-                f"> 数据更新时间：{format_beijing(forecast.updated_at)}（北京时间）",
-                f"> 最近记录的全局重置：{format_beijing(forecast.last_reset_at)}（北京时间）",
+                "【Codex 重置预报】",
+                "状态：较高（第三方预测）",
+                f"未来 24 小时概率：{forecast.probability_24h}%",
+                f"提醒阈值：严格大于 {threshold}%",
+                f"模型置信度：{self._confidence_label(forecast.confidence)}",
+                f"检查时间：{format_beijing(checked_at)}（北京时间）",
+                f"数据更新时间：{format_beijing(forecast.updated_at)}（北京时间）",
+                f"最近一次 X 公告/确认时间：{format_beijing(self._announcement_at(forecast))}（北京时间）",
+                *self._window_lines(forecast),
                 "",
-                '<font color="comment">说明：这是 codex-reset.com 的实验性预测，并非 OpenAI 官方预告，也不是你的个人额度倒计时。</font>',
-                f"[查看第三方数据源]({SITE_URL})",
+                "说明：这是 codex-reset.com 的实验性预测，并非 OpenAI 官方预告，也不是你的个人额度倒计时。",
+                f"第三方数据源：{SITE_URL}",
             ]
         )
-        self._send_markdown(content)
+        self._send_text(content)
 
     def send_reset_alert(self, forecast: Forecast, checked_at: datetime) -> None:
         content = "\n".join(
             [
-                "### Codex 重置动态",
-                "> 状态：<font color=\"info\">发现新记录</font>",
-                "> 告警内容：第三方数据源新增一条全局重置记录",
-                f"> 记录时间：{format_beijing(forecast.last_reset_at)}（北京时间）",
-                f"> 检测时间：{format_beijing(checked_at)}（北京时间）",
+                "【Codex 重置动态】",
+                "状态：发现新记录",
+                "告警内容：第三方数据源新增一条全局重置记录",
+                f"X 公告/确认时间：{format_beijing(self._announcement_at(forecast))}（北京时间）",
+                *self._window_lines(forecast),
+                f"检测时间：{format_beijing(checked_at)}（北京时间）",
                 "",
-                '<font color="comment">说明：请以 OpenAI 官方公告和你账号 Settings → Usage 中的实际状态为准。</font>',
-                f"[查看第三方数据源]({SITE_URL})",
+                "说明：X 公告/确认时间不一定等于额度实际生效时间；请以官方公告和你账号的实际状态为准。",
+                f"第三方数据源：{SITE_URL}",
             ]
         )
-        self._send_markdown(content)
+        self._send_text(content)
 
     def send_failure_alert(self, error: Exception, failures: int, checked_at: datetime) -> None:
         content = "\n".join(
             [
-                "### Codex 重置监控故障",
-                "> 状态：<font color=\"warning\">连续检查失败</font>",
-                f"> 连续失败次数：{failures}",
-                f"> 检查时间：{format_beijing(checked_at)}（北京时间）",
-                f"> 最近错误：{str(error)[:300]}",
+                "【Codex 重置监控故障】",
+                "状态：连续检查失败",
+                f"连续失败次数：{failures}",
+                f"检查时间：{format_beijing(checked_at)}（北京时间）",
+                f"最近错误：{str(error)[:300]}",
                 "",
-                '<font color="comment">监控会继续定时重试，恢复后会另行通知。</font>',
+                "监控会继续定时重试，恢复后会另行通知。",
             ]
         )
-        self._send_markdown(content)
+        self._send_text(content)
 
     def send_recovery_alert(self, previous_failures: int, checked_at: datetime) -> None:
         content = "\n".join(
             [
-                "### Codex 重置监控恢复",
-                "> 状态：<font color=\"info\">接口已恢复</font>",
-                f"> 此前连续失败：{previous_failures} 次",
-                f"> 恢复时间：{format_beijing(checked_at)}（北京时间）",
+                "【Codex 重置监控恢复】",
+                "状态：接口已恢复",
+                f"此前连续失败：{previous_failures} 次",
+                f"恢复时间：{format_beijing(checked_at)}（北京时间）",
             ]
         )
-        self._send_markdown(content)
+        self._send_text(content)
 
     def send_test_notification(self, checked_at: datetime) -> None:
         content = "\n".join(
             [
-                "### Codex 重置监控",
-                "> 状态：<font color=\"info\">企业微信推送配置成功</font>",
-                f"> 测试时间：{format_beijing(checked_at)}（北京时间）",
-                "> 备注：本次测试不会修改正式监控状态",
+                "【Codex 重置监控】",
+                "状态：微信兼容纯文本推送配置成功",
+                f"测试时间：{format_beijing(checked_at)}（北京时间）",
+                "备注：本次测试不会修改正式监控状态",
                 "",
-                '<font color="comment">正式消息会明确区分第三方预测、重置记录和监控故障。</font>',
+                "正式消息会明确区分第三方预测、X 公告/确认时间、预计重置窗口和监控故障。",
             ]
         )
-        self._send_markdown(content)
+        self._send_text(content)
 
 
 class GitHubStateStore:
