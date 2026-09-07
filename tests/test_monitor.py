@@ -20,6 +20,18 @@ NOW = datetime(2026, 8, 31, 8, 0, tzinfo=timezone.utc)
 FORECAST_LOW = Forecast(80, "2026-08-31T07:00:00Z", "2026-08-30T04:09:02Z", "low")
 FORECAST_HIGH = Forecast(81, "2026-08-31T07:00:00Z", "2026-08-30T04:09:02Z", "medium")
 FORECAST_AFTER_RESET = Forecast(25, "2026-08-31T08:00:00Z", "2026-08-31T07:55:00Z", "low")
+FORECAST_ANNOUNCED = Forecast(
+    25,
+    "2026-09-07T23:35:31Z",
+    "2026-08-31T02:34:27Z",
+    "low",
+    announcement_at="2026-09-07T19:24:57Z",
+    announcement_summary="A global reset for all paid subscriptions lands around 6pm PT.",
+    announcement_url="https://x.com/thsottiaux/status/2097043464538264003",
+    announcement_id="signal:2097043464538264003:likely",
+    announcement_tier="likely",
+    announcement_score=83,
+)
 
 
 class FakeStore:
@@ -39,6 +51,7 @@ class FakeNotifier:
     def __init__(self) -> None:
         self.probability_alerts: list[int] = []
         self.reset_alerts: list[str] = []
+        self.announcement_alerts: list[str] = []
         self.failure_alerts: list[int] = []
         self.recovery_alerts: list[int] = []
 
@@ -47,6 +60,9 @@ class FakeNotifier:
 
     def send_reset_alert(self, forecast: Forecast, checked_at: datetime) -> None:
         self.reset_alerts.append(forecast.last_reset_at)
+
+    def send_announcement_alert(self, forecast: Forecast, checked_at: datetime) -> None:
+        self.announcement_alerts.append(forecast.announcement_id or "")
 
     def send_failure_alert(self, error: Exception, failures: int, checked_at: datetime) -> None:
         self.failure_alerts.append(failures)
@@ -96,6 +112,25 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(notifier.reset_alerts, [])
         self.assertEqual(store.state.last_observed_reset_at, FORECAST_AFTER_RESET.last_reset_at)
 
+    def test_explicit_announcement_alerts_once_even_below_probability_threshold(self) -> None:
+        state = MonitorState(initialized=True, last_observed_reset_at=FORECAST_ANNOUNCED.last_reset_at)
+        store, notifier = FakeStore(state), FakeNotifier()
+        self.make_monitor(store, notifier, FORECAST_ANNOUNCED).run_once()
+        self.make_monitor(store, notifier, FORECAST_ANNOUNCED).run_once()
+        self.assertEqual(notifier.probability_alerts, [])
+        self.assertEqual(notifier.announcement_alerts, ["signal:2097043464538264003:likely"])
+        self.assertEqual(store.state.last_observed_announcement_id, "signal:2097043464538264003:likely")
+
+    def test_failed_announcement_is_not_marked_as_notified(self) -> None:
+        class FailingNotifier(FakeNotifier):
+            def send_announcement_alert(self, forecast: Forecast, checked_at: datetime) -> None:
+                raise RuntimeError("offline")
+
+        state = MonitorState(initialized=True, last_observed_reset_at=FORECAST_ANNOUNCED.last_reset_at)
+        store = FakeStore(state)
+        self.assertEqual(self.make_monitor(store, FailingNotifier(), FORECAST_ANNOUNCED).run_once(), 1)
+        self.assertIsNone(store.state.last_observed_announcement_id)
+
     def test_failure_alert_on_third_failure_and_recovery(self) -> None:
         store, notifier = FakeStore(), FakeNotifier()
         for _ in range(3):
@@ -141,6 +176,16 @@ class WeComNotifierTests(unittest.TestCase):
         self.assertIn("微信兼容纯文本", payload["text"]["content"])
         self.assertNotIn("markdown", payload)
 
+    def test_announcement_notification_includes_source_details(self) -> None:
+        notifier = WeComNotifier(self.WEBHOOK)
+        with patch("monitor.request_json", return_value={"errcode": 0}) as request:
+            notifier.send_announcement_alert(FORECAST_ANNOUNCED, NOW)
+
+        content = request.call_args.kwargs["payload"]["text"]["content"]
+        self.assertIn("明确预告（立即提醒）", content)
+        self.assertIn("A global reset for all paid subscriptions", content)
+        self.assertIn("https://x.com/thsottiaux/status/2097043464538264003", content)
+
     def test_beijing_format_respects_existing_timezone(self) -> None:
         self.assertEqual(format_beijing("2026-08-23T21:00:00Z"), "2026-08-24 05:00:00")
         self.assertEqual(format_beijing("2026-08-24T05:00:00+08:00"), "2026-08-24 05:00:00")
@@ -150,6 +195,13 @@ class WeComNotifierTests(unittest.TestCase):
             "updated_at": "2026-08-23T06:30:00Z",
             "last_reset_at": "2026-08-20T00:00:00Z",
             "probabilities": {"rounded_24h": 90},
+            "mode": "announced",
+            "signal_tier": "likely",
+            "alert_event_id": "signal:1:likely",
+            "official_signal": {
+                "tweet_id": "1",
+                "score": {"value": 83},
+            },
             "latest_alert": {
                 "source_at": "2026-08-23T06:29:05Z",
                 "summary": "Reset around 2 PM PT",
@@ -168,6 +220,8 @@ class WeComNotifierTests(unittest.TestCase):
 
         self.assertEqual(forecast.announcement_at, "2026-08-23T06:29:05Z")
         self.assertEqual(forecast.window_target_at, "2026-08-23T21:00:00Z")
+        self.assertEqual(forecast.announcement_id, "signal:1:likely")
+        self.assertEqual(forecast.announcement_score, 83)
         self.assertEqual(
             WeComNotifier._window_lines(forecast)[0],
             "预计重置窗口：2026-08-24 04:00:00 至 2026-08-24 06:00:00（北京时间）",

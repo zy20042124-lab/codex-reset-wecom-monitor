@@ -53,6 +53,9 @@ class Forecast:
     window_target_at: str | None = None
     window_label: str | None = None
     window_timezone: str | None = None
+    announcement_id: str | None = None
+    announcement_tier: str | None = None
+    announcement_score: int | None = None
 
 
 @dataclass
@@ -61,6 +64,7 @@ class MonitorState:
     initialized: bool = False
     above_threshold: bool = False
     last_observed_reset_at: str | None = None
+    last_observed_announcement_id: str | None = None
     consecutive_failures: int = 0
     failure_alert_sent: bool = False
     last_heartbeat_at: str | None = None
@@ -68,12 +72,16 @@ class MonitorState:
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "MonitorState":
         last_reset = raw.get("last_observed_reset_at")
+        last_announcement = raw.get("last_observed_announcement_id")
         heartbeat = raw.get("last_heartbeat_at")
         return cls(
             schema_version=max(1, int(raw.get("schema_version", 1))),
             initialized=bool(raw.get("initialized", False)),
             above_threshold=bool(raw.get("above_threshold", False)),
             last_observed_reset_at=last_reset if isinstance(last_reset, str) else None,
+            last_observed_announcement_id=(
+                last_announcement if isinstance(last_announcement, str) else None
+            ),
             consecutive_failures=max(0, int(raw.get("consecutive_failures", 0))),
             failure_alert_sent=bool(raw.get("failure_alert_sent", False)),
             last_heartbeat_at=heartbeat if isinstance(heartbeat, str) else None,
@@ -111,6 +119,18 @@ def valid_timestamp(value: Any) -> str | None:
     except ValueError:
         return None
     return value
+
+
+def valid_percentage(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = int(value)
+    return number if 0 <= number <= 100 else None
+
+
+def compact_text(value: str, limit: int = 360) -> str:
+    normalized = " ".join(value.split())
+    return normalized if len(normalized) <= limit else f"{normalized[:limit - 1]}…"
 
 
 def heartbeat_due(state: MonitorState, now: datetime) -> bool:
@@ -209,6 +229,17 @@ def fetch_forecast(*, attempts: int = 3, timeout: int = 15) -> Forecast:
                 window = payload.get("teased_window")
             if not isinstance(window, dict):
                 window = {}
+            official_signal = payload.get("official_signal")
+            if not isinstance(official_signal, dict):
+                official_signal = {}
+            is_announced = payload.get("mode") == "announced"
+            signal_id = payload.get("alert_event_id")
+            if not isinstance(signal_id, str) or not signal_id:
+                signal_id = official_signal.get("tweet_id")
+            if not is_announced or not isinstance(signal_id, str) or not signal_id:
+                signal_id = None
+            score = official_signal.get("score")
+            announcement_score = valid_percentage(score.get("value")) if isinstance(score, dict) else None
             return Forecast(
                 probability_24h=probability_int,
                 updated_at=updated_at,
@@ -229,6 +260,11 @@ def fetch_forecast(*, attempts: int = 3, timeout: int = 15) -> Forecast:
                 window_timezone=(
                     window.get("time_zone") if isinstance(window.get("time_zone"), str) else None
                 ),
+                announcement_id=signal_id,
+                announcement_tier=(
+                    payload.get("signal_tier") if isinstance(payload.get("signal_tier"), str) else None
+                ) if signal_id else None,
+                announcement_score=announcement_score if signal_id else None,
             )
         except (MonitorError, ValueError, TypeError) as exc:
             last_error = exc
@@ -327,6 +363,34 @@ class WeComNotifier:
                 f"检测时间：{format_beijing(checked_at)}（北京时间）",
                 "",
                 "说明：X 公告/确认时间不一定等于额度实际生效时间；请以官方公告和你账号的实际状态为准。",
+                f"第三方数据源：{SITE_URL}",
+            ]
+        )
+        self._send_text(content)
+
+    def send_announcement_alert(self, forecast: Forecast, checked_at: datetime) -> None:
+        if not forecast.announcement_id:
+            raise NotificationError("cannot send announcement without an announcement id")
+        summary = compact_text(forecast.announcement_summary or "数据源未提供原帖摘要")
+        tier = {"likely": "明确预告", "confirmed": "已确认"}.get(
+            forecast.announcement_tier or "", forecast.announcement_tier or "公开预告"
+        )
+        score_line = (
+            f"第三方信号分：{forecast.announcement_score}%" if forecast.announcement_score is not None else None
+        )
+        content = "\n".join(
+            [
+                "【Codex 重置预告】",
+                f"状态：{tier}（立即提醒）",
+                "告警内容：第三方数据源识别到新的公开重置预告信号",
+                f"X 发帖时间：{format_beijing(self._announcement_at(forecast))}（北京时间）",
+                *self._window_lines(forecast),
+                *([score_line] if score_line else []),
+                f"原帖摘要：{summary}",
+                *([f"原帖链接：{forecast.announcement_url}"] if forecast.announcement_url else []),
+                f"检测时间：{format_beijing(checked_at)}（北京时间）",
+                "",
+                "说明：这是基于公开 X 消息的第三方识别；实际重置或重置卡到账请以你的账号页面为准。",
                 f"第三方数据源：{SITE_URL}",
             ]
         )
@@ -542,6 +606,19 @@ class Monitor:
         if not state.last_observed_reset_at or new_reset:
             state.last_observed_reset_at = forecast.last_reset_at
 
+        new_announcement = (
+            forecast.announcement_id is not None
+            and forecast.announcement_id != state.last_observed_announcement_id
+        )
+        if new_announcement:
+            try:
+                self.notifier.send_announcement_alert(forecast, now)
+            except Exception as exc:
+                self._save_if_changed(state, original, now)
+                print(f"Announcement notification could not be sent: {exc}", file=sys.stderr)
+                return 1
+            state.last_observed_announcement_id = forecast.announcement_id
+
         is_above = forecast.probability_24h > self.threshold
         should_alert = is_above and (not state.initialized or not state.above_threshold)
         if should_alert:
@@ -557,7 +634,8 @@ class Monitor:
         self._save_if_changed(state, original, now)
         print(
             f"Checked {format_beijing(now)} Beijing: rounded_24h={forecast.probability_24h}% "
-            f"threshold=>{self.threshold}% alerted={should_alert} new_reset={new_reset}"
+            f"threshold=>{self.threshold}% alerted={should_alert} new_reset={new_reset} "
+            f"new_announcement={new_announcement}"
         )
         return 0
 
