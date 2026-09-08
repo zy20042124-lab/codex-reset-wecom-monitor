@@ -56,6 +56,7 @@ class Forecast:
     announcement_id: str | None = None
     announcement_tier: str | None = None
     announcement_score: int | None = None
+    probability_48h: int | None = None
 
 
 @dataclass
@@ -63,6 +64,7 @@ class MonitorState:
     schema_version: int = 1
     initialized: bool = False
     above_threshold: bool = False
+    above_threshold_48h: bool = False
     last_observed_reset_at: str | None = None
     last_observed_announcement_id: str | None = None
     consecutive_failures: int = 0
@@ -78,6 +80,7 @@ class MonitorState:
             schema_version=max(1, int(raw.get("schema_version", 1))),
             initialized=bool(raw.get("initialized", False)),
             above_threshold=bool(raw.get("above_threshold", False)),
+            above_threshold_48h=bool(raw.get("above_threshold_48h", False)),
             last_observed_reset_at=last_reset if isinstance(last_reset, str) else None,
             last_observed_announcement_id=(
                 last_announcement if isinstance(last_announcement, str) else None
@@ -211,6 +214,12 @@ def fetch_forecast(*, attempts: int = 3, timeout: int = 15) -> Forecast:
             probability_int = int(probability)
             if not 0 <= probability_int <= 100:
                 raise ForecastError("probabilities.rounded_24h is outside 0..100")
+            probability_48h = probabilities.get("rounded_48h")
+            if isinstance(probability_48h, bool) or not isinstance(probability_48h, (int, float)):
+                raise ForecastError("missing numeric probabilities.rounded_48h")
+            probability_48h_int = int(probability_48h)
+            if not 0 <= probability_48h_int <= 100:
+                raise ForecastError("probabilities.rounded_48h is outside 0..100")
 
             updated_at = payload.get("updated_at")
             last_reset_at = payload.get("last_reset_at")
@@ -265,6 +274,7 @@ def fetch_forecast(*, attempts: int = 3, timeout: int = 15) -> Forecast:
                     payload.get("signal_tier") if isinstance(payload.get("signal_tier"), str) else None
                 ) if signal_id else None,
                 announcement_score=announcement_score if signal_id else None,
+                probability_48h=probability_48h_int,
             )
         except (MonitorError, ValueError, TypeError) as exc:
             last_error = exc
@@ -339,6 +349,7 @@ class WeComNotifier:
                 "【Codex 重置预报】",
                 "状态：较高（第三方预测）",
                 f"未来 24 小时概率：{forecast.probability_24h}%",
+                f"未来 48 小时概率：{forecast.probability_48h}%",
                 f"提醒阈值：严格大于 {threshold}%",
                 f"模型置信度：{self._confidence_label(forecast.confidence)}",
                 f"检查时间：{format_beijing(checked_at)}（北京时间）",
@@ -347,6 +358,26 @@ class WeComNotifier:
                 *self._window_lines(forecast),
                 "",
                 "说明：这是 codex-reset.com 的实验性预测，并非 OpenAI 官方预告，也不是你的个人额度倒计时。",
+                f"第三方数据源：{SITE_URL}",
+            ]
+        )
+        self._send_text(content)
+
+    def send_48h_probability_alert(self, forecast: Forecast, threshold: int, checked_at: datetime) -> None:
+        content = "\n".join(
+            [
+                "【Codex 重置预报】",
+                "状态：提前关注（第三方预测）",
+                f"未来 48 小时概率：{forecast.probability_48h}%",
+                f"未来 24 小时概率：{forecast.probability_24h}%",
+                f"48 小时提醒阈值：严格大于 {threshold}%",
+                f"模型置信度：{self._confidence_label(forecast.confidence)}",
+                f"检查时间：{format_beijing(checked_at)}（北京时间）",
+                f"数据更新时间：{format_beijing(forecast.updated_at)}（北京时间）",
+                f"最近一次 X 公告/确认时间：{format_beijing(self._announcement_at(forecast))}（北京时间）",
+                *self._window_lines(forecast),
+                "",
+                "说明：这是 codex-reset.com 的实验性 48 小时预测，并非 OpenAI 官方预告，也不是你的个人额度倒计时。",
                 f"第三方数据源：{SITE_URL}",
             ]
         )
@@ -384,6 +415,8 @@ class WeComNotifier:
                 f"状态：{tier}（立即提醒）",
                 "告警内容：第三方数据源识别到新的公开重置预告信号",
                 f"X 发帖时间：{format_beijing(self._announcement_at(forecast))}（北京时间）",
+                f"未来 24 小时概率：{forecast.probability_24h}%",
+                f"未来 48 小时概率：{forecast.probability_48h}%",
                 *self._window_lines(forecast),
                 *([score_line] if score_line else []),
                 f"原帖摘要：{summary}",
@@ -545,12 +578,14 @@ class Monitor:
         notifier: Any,
         *,
         threshold: int = 80,
+        threshold_48h: int = 70,
         forecast_fetcher: Callable[[], Forecast] = fetch_forecast,
         clock: Callable[[], datetime] = utc_now,
     ) -> None:
         self.store = store
         self.notifier = notifier
         self.threshold = threshold
+        self.threshold_48h = threshold_48h
         self.forecast_fetcher = forecast_fetcher
         self.clock = clock
 
@@ -621,6 +656,13 @@ class Monitor:
 
         is_above = forecast.probability_24h > self.threshold
         should_alert = is_above and (not state.initialized or not state.above_threshold)
+        is_above_48h = forecast.probability_48h is not None and forecast.probability_48h > self.threshold_48h
+        should_alert_48h = (
+            is_above_48h
+            and (not state.initialized or not state.above_threshold_48h)
+            and not new_announcement
+            and not should_alert
+        )
         if should_alert:
             try:
                 self.notifier.send_probability_alert(forecast, self.threshold, now)
@@ -628,14 +670,23 @@ class Monitor:
                 self._save_if_changed(state, original, now)
                 print(f"Probability notification could not be sent: {exc}", file=sys.stderr)
                 return 1
+        if should_alert_48h:
+            try:
+                self.notifier.send_48h_probability_alert(forecast, self.threshold_48h, now)
+            except Exception as exc:
+                self._save_if_changed(state, original, now)
+                print(f"48-hour probability notification could not be sent: {exc}", file=sys.stderr)
+                return 1
 
         state.initialized = True
         state.above_threshold = is_above
+        state.above_threshold_48h = is_above_48h
         self._save_if_changed(state, original, now)
         print(
             f"Checked {format_beijing(now)} Beijing: rounded_24h={forecast.probability_24h}% "
-            f"threshold=>{self.threshold}% alerted={should_alert} new_reset={new_reset} "
-            f"new_announcement={new_announcement}"
+            f"rounded_48h={forecast.probability_48h}% threshold_24h=>{self.threshold}% "
+            f"threshold_48h=>{self.threshold_48h}% alerted_24h={should_alert} "
+            f"alerted_48h={should_alert_48h} new_reset={new_reset} new_announcement={new_announcement}"
         )
         return 0
 
@@ -661,8 +712,11 @@ def main() -> int:
     threshold = int(os.getenv("ALERT_THRESHOLD", "80"))
     if not 0 <= threshold < 100:
         raise MonitorError("ALERT_THRESHOLD must be between 0 and 99")
+    threshold_48h = int(os.getenv("ALERT_THRESHOLD_48H", "70"))
+    if not 0 <= threshold_48h < 100:
+        raise MonitorError("ALERT_THRESHOLD_48H must be between 0 and 99")
     store = GitHubStateStore.from_env()
-    return Monitor(store, notifier, threshold=threshold).run_once()
+    return Monitor(store, notifier, threshold=threshold, threshold_48h=threshold_48h).run_once()
 
 
 if __name__ == "__main__":

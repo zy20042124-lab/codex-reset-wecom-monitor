@@ -44,6 +44,7 @@ jobs:
         if: github.event_name == 'schedule' || inputs.mode == 'check-now'
         env:
           ALERT_THRESHOLD: "80"
+          ALERT_THRESHOLD_48H: "70"
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           STATE_BRANCH: monitor-state
           WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}

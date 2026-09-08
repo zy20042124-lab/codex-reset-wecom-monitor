@@ -17,9 +17,18 @@ from monitor import (
 
 
 NOW = datetime(2026, 8, 31, 8, 0, tzinfo=timezone.utc)
-FORECAST_LOW = Forecast(80, "2026-08-31T07:00:00Z", "2026-08-30T04:09:02Z", "low")
-FORECAST_HIGH = Forecast(81, "2026-08-31T07:00:00Z", "2026-08-30T04:09:02Z", "medium")
-FORECAST_AFTER_RESET = Forecast(25, "2026-08-31T08:00:00Z", "2026-08-31T07:55:00Z", "low")
+FORECAST_LOW = Forecast(
+    80, "2026-08-31T07:00:00Z", "2026-08-30T04:09:02Z", "low", probability_48h=70
+)
+FORECAST_HIGH = Forecast(
+    81, "2026-08-31T07:00:00Z", "2026-08-30T04:09:02Z", "medium", probability_48h=72
+)
+FORECAST_AFTER_RESET = Forecast(
+    25, "2026-08-31T08:00:00Z", "2026-08-31T07:55:00Z", "low", probability_48h=30
+)
+FORECAST_48_HIGH = Forecast(
+    50, "2026-08-31T07:00:00Z", "2026-08-30T04:09:02Z", "low", probability_48h=71
+)
 FORECAST_ANNOUNCED = Forecast(
     25,
     "2026-09-07T23:35:31Z",
@@ -31,6 +40,7 @@ FORECAST_ANNOUNCED = Forecast(
     announcement_id="signal:2097043464538264003:likely",
     announcement_tier="likely",
     announcement_score=83,
+    probability_48h=45,
 )
 
 
@@ -50,6 +60,7 @@ class FakeStore:
 class FakeNotifier:
     def __init__(self) -> None:
         self.probability_alerts: list[int] = []
+        self.probability_48h_alerts: list[int] = []
         self.reset_alerts: list[str] = []
         self.announcement_alerts: list[str] = []
         self.failure_alerts: list[int] = []
@@ -57,6 +68,9 @@ class FakeNotifier:
 
     def send_probability_alert(self, forecast: Forecast, threshold: int, checked_at: datetime) -> None:
         self.probability_alerts.append(forecast.probability_24h)
+
+    def send_48h_probability_alert(self, forecast: Forecast, threshold: int, checked_at: datetime) -> None:
+        self.probability_48h_alerts.append(forecast.probability_48h or 0)
 
     def send_reset_alert(self, forecast: Forecast, checked_at: datetime) -> None:
         self.reset_alerts.append(forecast.last_reset_at)
@@ -99,6 +113,20 @@ class MonitorTests(unittest.TestCase):
         self.make_monitor(store, notifier, FORECAST_HIGH).run_once()
         self.assertEqual(notifier.probability_alerts, [81])
 
+    def test_48_hour_threshold_alerts_once(self) -> None:
+        store, notifier = FakeStore(), FakeNotifier()
+        self.make_monitor(store, notifier, FORECAST_48_HIGH).run_once()
+        self.make_monitor(store, notifier, FORECAST_48_HIGH).run_once()
+        self.assertEqual(notifier.probability_alerts, [])
+        self.assertEqual(notifier.probability_48h_alerts, [71])
+        self.assertTrue(store.state.above_threshold_48h)
+
+    def test_24_hour_alert_suppresses_duplicate_48_hour_alert(self) -> None:
+        store, notifier = FakeStore(), FakeNotifier()
+        self.make_monitor(store, notifier, FORECAST_HIGH).run_once()
+        self.assertEqual(notifier.probability_alerts, [81])
+        self.assertEqual(notifier.probability_48h_alerts, [])
+
     def test_newer_reset_time_sends_one_alert(self) -> None:
         state = MonitorState(initialized=True, last_observed_reset_at=FORECAST_LOW.last_reset_at)
         store, notifier = FakeStore(state), FakeNotifier()
@@ -118,6 +146,7 @@ class MonitorTests(unittest.TestCase):
         self.make_monitor(store, notifier, FORECAST_ANNOUNCED).run_once()
         self.make_monitor(store, notifier, FORECAST_ANNOUNCED).run_once()
         self.assertEqual(notifier.probability_alerts, [])
+        self.assertEqual(notifier.probability_48h_alerts, [])
         self.assertEqual(notifier.announcement_alerts, ["signal:2097043464538264003:likely"])
         self.assertEqual(store.state.last_observed_announcement_id, "signal:2097043464538264003:likely")
 
@@ -194,7 +223,7 @@ class WeComNotifierTests(unittest.TestCase):
         payload = {
             "updated_at": "2026-08-23T06:30:00Z",
             "last_reset_at": "2026-08-20T00:00:00Z",
-            "probabilities": {"rounded_24h": 90},
+            "probabilities": {"rounded_24h": 90, "rounded_48h": 95},
             "mode": "announced",
             "signal_tier": "likely",
             "alert_event_id": "signal:1:likely",
@@ -222,6 +251,7 @@ class WeComNotifierTests(unittest.TestCase):
         self.assertEqual(forecast.window_target_at, "2026-08-23T21:00:00Z")
         self.assertEqual(forecast.announcement_id, "signal:1:likely")
         self.assertEqual(forecast.announcement_score, 83)
+        self.assertEqual(forecast.probability_48h, 95)
         self.assertEqual(
             WeComNotifier._window_lines(forecast)[0],
             "预计重置窗口：2026-08-24 04:00:00 至 2026-08-24 06:00:00（北京时间）",
