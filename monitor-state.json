@@ -1,5 +1,6 @@
 {
   "above_threshold": false,
+  "above_threshold_48h": true,
   "consecutive_failures": 0,
   "failure_alert_sent": false,
   "initialized": true,
