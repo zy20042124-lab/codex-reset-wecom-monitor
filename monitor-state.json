@@ -1,11 +1,11 @@
 {
   "above_threshold": false,
-  "above_threshold_48h": true,
+  "above_threshold_48h": false,
   "consecutive_failures": 0,
   "failure_alert_sent": false,
   "initialized": true,
   "last_heartbeat_at": "2026-09-01T16:56:41.495950Z",
-  "last_observed_announcement_id": "signal:2097043464538264003:likely",
+  "last_observed_announcement_id": "signal:2098612714704891959:likely",
   "last_observed_reset_at": "2026-09-08T04:05:53.000Z",
   "schema_version": 1
 }
